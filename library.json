@@ -1,0 +1,33 @@
+{
+    "name": "libsensor-drivers",
+    "version": "1.0.0",
+    "description": "A library of sensor driver implementations using the libsensor framework.",
+    "keywords": "bme280, ccs811, dps368, rfm69hcw, scd41, tmp117, sensor, esp-idf, esp32, esp8266",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/khoek/libsensor-drivers.git"
+    },
+    "authors": [
+        {
+            "name": "Keeley Hoek",
+            "email": "keeley@hoek.io",
+            "url": "https://hoek.io"
+        }
+    ],
+    "license": "MIT",
+    "homepage": "https://github.com/khoek/libsensor-drivers",
+    "frameworks": "espidf",
+    "platforms": "espressif32",
+    "dependencies": {
+        "khoek/libsensor": "^2.0.0",
+        "khoek/libirq": "^2.0.0",
+        "khoek/libtask": "^1.0.0",
+        "khoek/libcrc": "^2.0.0",
+        "khoek/esp-ccs811": "^3.0.0",
+        "khoek/esp-dps368": "^3.0.0",
+        "khoek/esp-rfm69hcw": "^2.0.0",
+        "khoek/esp-tmp117": "^2.0.0",
+        "khoek/esp-scd41": "^1.0.0",
+        "khoek/esp-bme280": "^1.0.0"
+    }
+}
