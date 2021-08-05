@@ -1,25 +1,109 @@
 #include <cJSON.h>
 #include <device/rfm69hcw.h>
+#include <esp_err.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
 #include <libcrc.h>
+#include <libesp/json.h>
+#include <libesp/marshall.h>
 #include <libiot.h>
 #include <libirq.h>
 #include <libtask.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/cdefs.h>
 
 #include "../common.h"
 
 static const char* TAG = "sensor(rfm69hcw)";
 
-typedef struct rfm69hcw_w_irq {
+typedef struct dev_info {
     rfm69hcw_handle_t dev;
+    gpio_num_t pin_irq;
+} dev_info_t;
+
+typedef struct ctx {
+    int32_t last_rain;
 
     libirq_source_handle_t src;
     libirq_waiter_t waiter;
 
     libtask_loop_handle_t monitor_task;
-} rfm69hcw_w_irq_t;
+
+    EventGroupHandle_t events;
+#define CTX_EVENT_MONITOR_STOP (1ULL << 0)
+} ctx_t;
+
+#define IRQ_CORE_NUM 1
+
+#define IRQ_TASK_PRIORITY 10
+#define IRQ_TASK_STACK_SIZE 4096
+
+#define MONITOR_TASK_PRIORITY 10
+#define MONITOR_TASK_STACK_SIZE 2048
+#define MONITOR_TASK_DELAY_MS (60 * 1000)
+
+static libtask_disposition_t monitor_trigger_once(ctx_t* ctx) {
+    libirq_source_trigger(ctx->src);
+
+    // This call will usually cause us to sleep for `MONITOR_TASK_DELAY_MS` ms,
+    // and the event group is used to wake the task up from a sleep of this
+    // (potentially quite long) duration early;
+    EventBits_t bits =
+        xEventGroupWaitBits(ctx->events, CTX_EVENT_MONITOR_STOP, false, false,
+                            MONITOR_TASK_DELAY_MS / portTICK_PERIOD_MS);
+    if (bits & CTX_EVENT_MONITOR_STOP) {
+        return LIBTASK_DISPOSITION_STOP;
+    }
+
+    return LIBTASK_DISPOSITION_CONTINUE;
+}
+
+static void* ctx_init(dev_info_t* info) {
+    ctx_t* ctx = malloc(sizeof(ctx_t));
+    ctx->last_rain = -1;
+
+    ESP_ERROR_CHECK(
+        libirq_source_create(info->pin_irq, true, IRQ_CORE_NUM, &ctx->src));
+    ctx->waiter = libirq_waiter_create(ctx->src);
+
+    ctx->events = xEventGroupCreate();
+
+    // TODO consider measuring FEI
+
+    // This loop task just wakes up the poll task (using
+    // `libirq_source_trigger()`) every 60 seconds in order to get it to do a
+    // check of the current mode (so that we don't lock up if the RFM69HCW ever
+    // spontaneously decides to switch out of RX mode).
+    ESP_ERROR_CHECK(
+        libtask_loop_spawn((libtask_do_once_fn_t) monitor_trigger_once, ctx,
+                           "rfm69hcw_monitor", MONITOR_TASK_STACK_SIZE,
+                           MONITOR_TASK_PRIORITY, &ctx->monitor_task));
+
+    return ctx;
+}
+
+static void ctx_destroy(ctx_t* ctx) {
+    // First we need to stop the monitor task, so that we can destroy the irq
+    // source it has a reference to.
+
+    // Mark this monitor task as "should stop", so that it will complete at most
+    // one more iteration.
+    libtask_loop_mask_should_stop(ctx->monitor_task);
+
+    // Wait the monitor task up from its sleep early.
+    xEventGroupSetBits(ctx->events, CTX_EVENT_MONITOR_STOP);
+
+    // Wait for the monitor task to wake due to the message we sent.
+    libtask_loop_join(ctx->monitor_task);
+
+    // Now the monitor task has completed, and has been freed.
+    libirq_source_destroy(ctx->src);
+    libirq_waiter_destroy(ctx->waiter);
+
+    free(ctx);
+}
 
 typedef struct lacrosse_payload {
     uint8_t b[6];
@@ -36,7 +120,7 @@ typedef struct lacrosse_packet {
     };
     uint8_t crc8;
     uint8_t trailer[4];
-} __attribute__((packed)) lacrosse_packet_t;
+} __packed lacrosse_packet_t;
 
 typedef struct lacrosse_packet_frame {
     lacrosse_packet_t pkt;
@@ -51,92 +135,72 @@ typedef struct lacrosse_packet_frame {
 #define LACROSSE_ID_TYPE_LTV_RV3 0x70F
 #define LACROSSE_ID_TYPE_LTV_WSDTH04 0x88F
 
-static inline void convert_3b8_to_1b24(uint32_t* v, uint8_t o1, uint8_t o2, uint8_t o3) {
-    *v = (((uint32_t) o1) << 16) | (((uint32_t) o2) << 8) | (((uint32_t) o3) << 0);
-}
-
-static inline void convert_2b8_to_1b16(uint16_t* v, uint8_t o1, uint8_t o2) {
-    *v = (((uint32_t) o1) << 8) | (((uint32_t) o2) << 0);
-}
-
-static inline void convert_3b8_to_2b16(uint16_t* v1, uint16_t* v2, uint8_t o1, uint8_t o2, uint8_t o3) {
-    *v1 = (((uint16_t) o1) << 4) | (((uint16_t) o2) >> 4);
-    *v2 = (((uint16_t) o2 & 0x0F) << 8) | (((uint16_t) o3) >> 0);
-}
-
 #define MIDDLE_BYTE_MAGIC 0xAA
 
 static void check_magic_byte(uint8_t pos, uint8_t b) {
     if (b != 0xAA) {
-        libiot_logf_error(TAG, "magic byte (%d) is 0x%02X not 0x%02X!", pos, b, MIDDLE_BYTE_MAGIC);
+        libiot_logf_error(TAG, "magic byte (%d) is 0x%02X not 0x%02X!", pos, b,
+                          MIDDLE_BYTE_MAGIC);
     }
 }
 
 #define RAIN_MM_WARN_MAX (200.0)
 
-static int32_t last_rain = -1;
-
-static cJSON* handle_lacrosse_ltv_rv3_payload(const char* tag, const lacrosse_payload_t* payload, uint8_t rssi) {
+static cJSON* handle_lacrosse_ltv_rv3_payload(const char* tag, ctx_t* ctx,
+                                              const lacrosse_payload_t* payload,
+                                              uint8_t rssi) {
     check_magic_byte(1, payload->b[1]);
     check_magic_byte(4, payload->b[4]);
 
+    double rssi_db = ((double) rssi) * (-0.5);
+
     uint16_t rain_now;
     uint16_t rain_before;
-    convert_2b8_to_1b16(&rain_now, payload->b[0], payload->b[2]);
-    convert_2b8_to_1b16(&rain_before, payload->b[3], payload->b[5]);
+    marshall_2u8_to_1u16_be_args(&rain_now, payload->b[0], payload->b[2]);
+    marshall_2u8_to_1u16_be_args(&rain_before, payload->b[3], payload->b[5]);
 
-    if (rain_before != last_rain && last_rain != -1) {
-        libiot_logf_error(TAG, "ltv_rv3: packet skipped! rain was 0x%02X, but last reported is 0x%02X", last_rain, rain_before);
+    // Note: The initial value of `ctx->last_rain` is -1.
+    if (rain_before != ctx->last_rain && ctx->last_rain != -1) {
+        libiot_logf_error(TAG,
+                          "ltv_rv3: packet skipped! rain was 0x%02X, but last "
+                          "reported is 0x%02X",
+                          ctx->last_rain, rain_before);
     }
 
-    last_rain = rain_now;
-
-    // FIXME detect skips
+    ctx->last_rain = rain_now;
 
     // Rain in 1/10ths of an inch.
     uint16_t rain_in = rain_now - rain_before;
-    double delta_rain_mm = 0.254 * ((double) rain_in);
+    double rain_delta_mm = 0.254 * ((double) rain_in);
 
-    if (delta_rain_mm >= RAIN_MM_WARN_MAX) {
-        libiot_logf_error(TAG, "ltv_rv3: too much rain! %lf (0x%X,0x%X)", delta_rain_mm, rain_now, rain_before);
+    if (rain_delta_mm >= RAIN_MM_WARN_MAX) {
+        libiot_logf_error(TAG, "ltv_rv3: too much rain! %lf (0x%X,0x%X)",
+                          rain_delta_mm, rain_now, rain_before);
     }
 
-    ESP_LOGI(TAG, "(%s) measure: ltv_rv3: delta_rain(mm)=%.1lf (rain_now=0x%03X, rain_before=0x%03X)", tag, delta_rain_mm, rain_now, rain_before);
+    ESP_LOGI(TAG,
+             "(%s) measure: ltv_rv3: delta_rain(mm)=%.1lf (rain_now=0x%03X, "
+             "rain_before=0x%03X)",
+             tag, rain_delta_mm, rain_now, rain_before);
 
-    cJSON* json_root = cJSON_CreateObject();
-    if (!json_root) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
+    cJSON* json_root;
+    cJSON_CREATE_ROOT_OBJ_OR_GOTO(&json_root, handle_lacrosse_rv3_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "rssi", rssi_db,
+                                         handle_lacrosse_rv3_payload_out);
 
-    cJSON* json_delta_mm = cJSON_CreateNumber(delta_rain_mm);
-    if (!json_delta_mm) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "delta_mm", json_delta_mm);
-
-    cJSON* json_raw = cJSON_CreateObject();
-    if (!json_raw) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "raw", json_raw);
-
-    cJSON* json_rain_now = cJSON_CreateNumber(rain_now);
-    if (!json_rain_now) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
-    cJSON_AddItemToObject(json_raw, "rain_now", json_rain_now);
-
-    cJSON* json_rain_before = cJSON_CreateNumber(rain_before);
-    if (!json_rain_before) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
-    cJSON_AddItemToObject(json_raw, "rain_before", json_rain_before);
-
-    cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
-    if (!json_rssi) {
-        goto handle_lacrosse_rv3_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "rssi", json_rssi);
+    cJSON* json_rain_delta_mm;
+    cJSON_INSERT_OBJ_INTO_OBJ_OR_GOTO(json_root, "rain_delta_mm",
+                                      &json_rain_delta_mm,
+                                      handle_lacrosse_rv3_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_rain_delta_mm, "value",
+                                         rain_delta_mm,
+                                         handle_lacrosse_rv3_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_rain_delta_mm, "raw_now",
+                                         rain_now,
+                                         handle_lacrosse_rv3_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_rain_delta_mm, "raw_before",
+                                         rain_before,
+                                         handle_lacrosse_rv3_payload_out);
 
     return json_root;
 
@@ -148,56 +212,43 @@ handle_lacrosse_rv3_payload_out:
     return NULL;
 }
 
-static cJSON* handle_lacrosse_ltv_wsdth04_payload(const char* tag, const lacrosse_payload_t* payload, uint8_t rssi) {
+static cJSON* handle_lacrosse_ltv_wsdth04_payload(
+    const char* tag, const lacrosse_payload_t* payload, uint8_t rssi) {
+    double rssi_db = ((double) rssi) * (-0.5);
+
     uint16_t raw_temp;
     uint16_t raw_hum;
-    convert_3b8_to_2b16(&raw_temp, &raw_hum, payload->b[0], payload->b[1], payload->b[2]);
+    marshall_3u8_to_2u12_be(&raw_temp, &raw_hum, &payload->b[0]);
 
     uint16_t raw_wind_speed;
     uint16_t raw_wind_dir;
-    convert_3b8_to_2b16(&raw_wind_speed, &raw_wind_dir, payload->b[3], payload->b[4], payload->b[5]);
+    marshall_3u8_to_2u12_be(&raw_wind_speed, &raw_wind_dir, &payload->b[3]);
 
     // Temp in degrees Celsius
-    double temp = ((double) (raw_temp - 400)) * 0.1;
+    double temp_c = (((double) raw_temp) - 400.0) * 0.1;
     // Wind speed in kph
-    double wind_speed = ((double) raw_wind_speed) * 0.1;
+    double wind_speed_kph = ((double) raw_wind_speed) * 0.1;
 
-    ESP_LOGI(TAG, "(%s) measure: ltv_wsdth04: temp(degC)=%.1lf, rel_hum=%d%%, wind_speed(kph)=%.1lf, wind_dir(deg)=%d", tag, temp, raw_hum, wind_speed, raw_wind_dir);
+    ESP_LOGI(TAG,
+             "(%s) measure: ltv_wsdth04: temp(degC)=%.1lf, rel_hum=%d%%, "
+             "wind_speed(kph)=%.1lf, wind_dir(deg)=%d",
+             tag, temp_c, raw_hum, wind_speed_kph, raw_wind_dir);
 
-    cJSON* json_root = cJSON_CreateObject();
-    if (!json_root) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-
-    cJSON* json_temp_c = cJSON_CreateNumber(temp);
-    if (!json_temp_c) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "temp_c", json_temp_c);
-
-    cJSON* json_rel_humidity = cJSON_CreateNumber(raw_hum);
-    if (!json_rel_humidity) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "rel_humidity", json_rel_humidity);
-
-    cJSON* json_wind_speed = cJSON_CreateNumber(wind_speed);
-    if (!json_wind_speed) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "wind_speed_kph", json_wind_speed);
-
-    cJSON* json_wind_dir = cJSON_CreateNumber(raw_wind_dir);
-    if (!json_wind_dir) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "wind_dir_deg", json_wind_dir);
-
-    cJSON* json_rssi = cJSON_CreateNumber(((double) rssi) * (-0.5));
-    if (!json_rssi) {
-        goto handle_lacrosse_breezepro_payload_out;
-    }
-    cJSON_AddItemToObject(json_root, "rssi", json_rssi);
+    cJSON* json_root;
+    cJSON_CREATE_ROOT_OBJ_OR_GOTO(&json_root,
+                                  handle_lacrosse_breezepro_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "rssi", rssi_db,
+                                         handle_lacrosse_breezepro_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "temp_c", temp_c,
+                                         handle_lacrosse_breezepro_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "rel_humidity", raw_hum,
+                                         handle_lacrosse_breezepro_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "wind_speed_kph",
+                                         wind_speed_kph,
+                                         handle_lacrosse_breezepro_payload_out);
+    cJSON_INSERT_NUMBER_INTO_OBJ_OR_GOTO(json_root, "wind_dir_deg",
+                                         raw_wind_dir,
+                                         handle_lacrosse_breezepro_payload_out);
 
     return json_root;
 
@@ -209,20 +260,25 @@ handle_lacrosse_breezepro_payload_out:
     return NULL;
 }
 
-static cJSON* report(const char* tag, rfm69hcw_w_irq_t* data, const lacrosse_rx_t* frame) {
+static cJSON* report(const char* tag, dev_info_t* info, ctx_t* ctx,
+                     const lacrosse_rx_t* frame) {
     const lacrosse_packet_t* pkt = &frame->pkt;
 
     uint32_t id;
-    convert_3b8_to_1b24(&id, pkt->data.id[0], pkt->data.id[1], pkt->data.id[2]);
+    marshall_3u8_to_1u24_be(&id, pkt->data.id);
 
-    uint8_t seq_num = (pkt->data.status & MASK_LACROSSE_SEQ_NUM) >> SHIFT_LACROSSE_SEQ_NUM;
+    uint8_t seq_num =
+        (pkt->data.status & MASK_LACROSSE_SEQ_NUM) >> SHIFT_LACROSSE_SEQ_NUM;
     uint8_t status = pkt->data.status & ~MASK_LACROSSE_SEQ_NUM;
 
     uint8_t true_crc8 = crc8_calc_lacrosse(pkt->raw, sizeof(pkt->raw));
     bool crc8_valid = pkt->crc8 == true_crc8;
 
-    ESP_LOGI(TAG, "(%s) measure: packet(rssi=0x%02X): id=0x%06X, seq=%d, status=0x%02X, crc=%s (0x%02X vs 0x%02X)",
-             tag, frame->rssi, id, seq_num, status, crc8_valid ? "OK" : "BAD", pkt->crc8, true_crc8);
+    ESP_LOGI(TAG,
+             "(%s) measure: packet(rssi=0x%02X): id=0x%06X, seq=%d, "
+             "status=0x%02X, crc=%s (0x%02X vs 0x%02X)",
+             tag, frame->rssi, id, seq_num, status, crc8_valid ? "OK" : "BAD",
+             pkt->crc8, true_crc8);
 
     if (!crc8_valid) {
         ESP_LOGW(TAG, "bad crc!");
@@ -231,59 +287,75 @@ static cJSON* report(const char* tag, rfm69hcw_w_irq_t* data, const lacrosse_rx_
 
     switch ((id & MASK_LACROSSE_ID_TYPE) >> SHIFT_LACROSSE_ID_TYPE) {
         case LACROSSE_ID_TYPE_LTV_RV3: {
-            return handle_lacrosse_ltv_rv3_payload(tag, &pkt->data.payload, frame->rssi);
+            return handle_lacrosse_ltv_rv3_payload(tag, ctx, &pkt->data.payload,
+                                                   frame->rssi);
         }
         case LACROSSE_ID_TYPE_LTV_WSDTH04: {
-            return handle_lacrosse_ltv_wsdth04_payload(tag, &pkt->data.payload, frame->rssi);
+            return handle_lacrosse_ltv_wsdth04_payload(tag, &pkt->data.payload,
+                                                       frame->rssi);
         }
         default: {
-            libiot_logf_error(TAG, "well-formed packet with unknown id type: 0x%X", id);
+            libiot_logf_error(TAG,
+                              "well-formed packet with unknown id type: 0x%X",
+                              id);
             return NULL;
         }
     }
 }
 
-static void handle_payload_ready(rfm69hcw_handle_t dev, QueueHandle_t queue) {
-    lacrosse_rx_t frame;
+static void handle_payload_ready(rfm69hcw_handle_t dev,
+                                 sensor_output_handle_t output) {
+    lacrosse_rx_t* frame = malloc(sizeof(lacrosse_rx_t));
 
-    // Must read RSSI_VALUE before emptying the FIFO, since this will cause an RX restart
-    // and we get a race.
-    frame.rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
-    // Note that due to an idiosyncrasy with the RFM69HCW when `RFM69HCW_AFC_FEI_AFC_AUTOCLEAR_ON` is
-    // set then at this point (i.e. even before the FIFO has been emptied) the `RFM69HCW_REG_AFC_MSB/LSB`
-    // registers have already been cleared to zero. However, if the packet never arrives and the timeout
-    // IRQ triggers then the AFC value is safe to read.
+    // Must read RSSI_VALUE before emptying the FIFO, since this will cause an
+    // RX restart and we get a race.
+    ESP_ERROR_CHECK(
+        rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE, &frame->rssi));
+    // Note that due to an idiosyncrasy with the RFM69HCW when
+    // `RFM69HCW_AFC_FEI_AFC_AUTOCLEAR_ON` is set then at this point (i.e. even
+    // before the FIFO has been emptied) the `RFM69HCW_REG_AFC_MSB/LSB`
+    // registers have already been cleared to zero. However, if the packet never
+    // arrives and the timeout IRQ triggers then the AFC value is safe to read.
     //
-    // If we desperately want to know the AFC value then we can disable AFC autoclear and perform the clear
-    // ourselves as part of the RSSI IRQ interrupt handler.
+    // If we desperately want to know the AFC value then we can disable AFC
+    // autoclear and perform the clear ourselves as part of the RSSI IRQ
+    // interrupt handler.
 
     // Read out the FIFO contents.
-    uint8_t* buff = (uint8_t*) &frame.pkt;
+    uint8_t* buff = (uint8_t*) &frame->pkt;
     for (int i = 0; i < sizeof(lacrosse_packet_t); i++) {
-        buff[i] = rfm69hcw_reg_read(dev, RFM69HCW_REG_FIFO);
+        ESP_ERROR_CHECK(rfm69hcw_reg_read(dev, RFM69HCW_REG_FIFO, buff + i));
     }
 
-    if (xQueueSend(queue, &frame, 0) != pdTRUE) {
-        libiot_logf_error(TAG, "can't queue result");
-    }
+    libsensor_output_item(output, frame);
 }
 
 #define MAX_WAIT_ITERS 10
 
-static sensor_poll_result_t poll(const char* tag, rfm69hcw_w_irq_t* data, QueueHandle_t queue) {
+static sensor_poll_result_t poll(const char* tag, dev_info_t* info, ctx_t* ctx,
+                                 sensor_output_handle_t output) {
     // Wait for RSSI IRQ
-    if (!libirq_waiter_sleep_until_active(data->waiter)) {
+    if (!libirq_waiter_sleep_until_active(ctx->waiter)) {
         abort();
     }
 
-    rfm69hcw_handle_t dev = data->dev;
+    rfm69hcw_handle_t dev = info->dev;
 
-    uint8_t op_mode = rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE);
+    uint8_t op_mode;
+    ESP_ERROR_CHECK(rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE, &op_mode));
     if ((op_mode & MASK_RFM69HCW_OP_MODE_MODE) != RFM69HCW_OP_MODE_MODE_RX) {
-        libiot_logf_error(TAG, "state error: bad op mode (not rx), fixing! (0x%02X,0x%02X,0x%02X)",
-                          op_mode,
-                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1),
-                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
+        uint8_t irq_flags_1;
+        uint8_t irq_flags_2;
+
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1, &irq_flags_1));
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2, &irq_flags_2));
+
+        libiot_logf_error(
+            TAG,
+            "state error: bad op mode (not rx), fixing! (0x%02X,0x%02X,0x%02X)",
+            op_mode, irq_flags_1, irq_flags_2);
 
         return SENSOR_POLL_RESULT_FAIL;
     }
@@ -293,22 +365,28 @@ static sensor_poll_result_t poll(const char* tag, rfm69hcw_w_irq_t* data, QueueH
     int i;
 
     for (i = 0; i < MAX_WAIT_ITERS; i++) {
+        uint8_t irq_flags_2;
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2, &irq_flags_2));
+
         // Has a full packet been recieved?
-        if (rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2) & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY) {
-            handle_payload_ready(dev, queue);
+        if (irq_flags_2 & RFM69HCW_IRQ_FLAGS_2_PAYLOAD_READY) {
+            handle_payload_ready(dev, output);
             goto handle_rssi_irq_out;
         }
 
-        uint8_t flags_1 = rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1);
+        uint8_t irq_flags_1;
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1, &irq_flags_1));
 
         // Is this interrupt spurious?
-        if (!(flags_1 & RFM69HCW_IRQ_FLAGS_1_RSSI)) {
+        if (!(irq_flags_1 & RFM69HCW_IRQ_FLAGS_1_RSSI)) {
             // Spurious IRQ, so just ignore it.
             goto handle_rssi_irq_out;
         }
 
         // Have we timed out waiting for a packet?
-        if (flags_1 & RFM69HCW_IRQ_FLAGS_1_TIMEOUT) {
+        if (irq_flags_1 & RFM69HCW_IRQ_FLAGS_1_TIMEOUT) {
             break;
         }
 
@@ -320,23 +398,39 @@ static sensor_poll_result_t poll(const char* tag, rfm69hcw_w_irq_t* data, QueueH
         goto handle_rssi_irq_out;
     }
 
-    uint8_t rssi = rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE);
-    uint8_t afc_value_msb = rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_MSB);
-    uint8_t afc_value_lsb = rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_LSB);
-    uint16_t afc_value = (((uint16_t) afc_value_msb) << 8) | (((uint16_t) afc_value_lsb) << 0);
+    uint8_t rssi;
+    uint8_t afc_value_msb;
+    uint8_t afc_value_lsb;
 
-    uint8_t val = rfm69hcw_reg_read(dev, RFM69HCW_REG_PACKET_CONFIG_2);
-    rfm69hcw_reg_write(dev, RFM69HCW_REG_PACKET_CONFIG_2, val | RFM69HCW_PACKET_CONFIG_2_RESTART_RX);
+    ESP_ERROR_CHECK(rfm69hcw_reg_read(dev, RFM69HCW_REG_RSSI_VALUE, &rssi));
+    ESP_ERROR_CHECK(
+        rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_MSB, &afc_value_msb));
+    ESP_ERROR_CHECK(
+        rfm69hcw_reg_read(dev, RFM69HCW_REG_AFC_LSB, &afc_value_lsb));
+
+    uint16_t afc_value =
+        (((uint16_t) afc_value_msb) << 8) | (((uint16_t) afc_value_lsb) << 0);
+
+    uint8_t pkt_cfg_2;
+    ESP_ERROR_CHECK(
+        rfm69hcw_reg_read(dev, RFM69HCW_REG_PACKET_CONFIG_2, &pkt_cfg_2));
+    ESP_ERROR_CHECK(
+        rfm69hcw_reg_write(dev, RFM69HCW_REG_PACKET_CONFIG_2,
+                           pkt_cfg_2 | RFM69HCW_PACKET_CONFIG_2_RESTART_RX));
 
     for (i = 0; i < MAX_WAIT_ITERS; i++) {
-        if (!(rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1) & RFM69HCW_IRQ_FLAGS_1_TIMEOUT)) {
+        uint8_t irq_flags_1;
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1, &irq_flags_1));
+        if (!(irq_flags_1 & RFM69HCW_IRQ_FLAGS_1_TIMEOUT)) {
             break;
         }
 
         vTaskDelay(1);
     }
 
-    ESP_LOGI(TAG, "rssi timeout, restarting rx (rssi=0x%02X, afc_value=0x%04X)", rssi, afc_value);
+    ESP_LOGI(TAG, "rssi timeout, restarting rx (rssi=0x%02X, afc_value=0x%04X)",
+             rssi, afc_value);
 
     if (i >= MAX_WAIT_ITERS) {
         fail_msg = "max iters exceeded after rx restart!";
@@ -345,11 +439,16 @@ static sensor_poll_result_t poll(const char* tag, rfm69hcw_w_irq_t* data, QueueH
 
 handle_rssi_irq_out:
     if (fail_msg) {
-        libiot_logf_error(TAG, "%s (0x%02X,0x%02X,0x%02X)",
-                          fail_msg,
-                          rfm69hcw_reg_read(dev, RFM69HCW_REG_OP_MODE),
-                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1),
-                          rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2));
+        uint8_t irq_flags_1;
+        uint8_t irq_flags_2;
+
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_1, &irq_flags_1));
+        ESP_ERROR_CHECK(
+            rfm69hcw_reg_read(dev, RFM69HCW_REG_IRQ_FLAGS_2, &irq_flags_2));
+
+        libiot_logf_error(TAG, "%s (0x%02X,0x%02X,0x%02X)", fail_msg, op_mode,
+                          irq_flags_1, irq_flags_2);
     }
 
     return SENSOR_POLL_RESULT_MADE_PROGRESS;
@@ -375,84 +474,52 @@ static const rfm69hcw_rx_config_t RFM69HCW_CFG = {
     .timeout_rssi_thresh = 30,   // ~50ms
 };
 
-static void dev_start(rfm69hcw_w_irq_t* data, void* unused) {
-    rfm69hcw_configure_rx(data->dev, &RFM69HCW_CFG);
+static void dev_start(dev_info_t* info, ctx_t* ctx) {
+    ESP_ERROR_CHECK(rfm69hcw_configure_rx(info->dev, &RFM69HCW_CFG));
+}
+
+static void dev_destroy(dev_info_t* info) {
+    rfm69hcw_destroy(info->dev);
+    free(info);
 }
 
 static sensor_type_t SENSOR_RFM69HCW_LACROSSE = {
-    .name = LIBSENSOR_NAME_RFM69HCW_LACROSSE,
-
-    .queue_item_size = sizeof(lacrosse_rx_t),
-    .queue_length = 4,
+    .model = LIBSENSOR_NAME_RFM69HCW_LACROSSE,
 
     .poll_delay_ms = 0,
     .max_uneventful_iters = 0,
 
+    .poll_task_stack_size = 2048,
+    .report_task_stack_size = 2560,
+
+    .dev_destroy = (sensor_dev_destroy_fn_t) dev_destroy,
     .dev_start = (sensor_dev_start_fn_t) dev_start,
 
     .poll = (sensor_poll_fn_t) poll,
     .report = (sensor_report_fn_t) report,
+
+    .ctx_init = (sensor_ctx_init_fn_t) ctx_init,
+    .ctx_destroy = (sensor_ctx_destroy_fn_t) ctx_destroy,
 };
 
-#define IRQ_CORE_NUM 1
-
-#define IRQ_TASK_PRIORITY 10
-#define IRQ_TASK_STACK_SIZE 4096
-
-#define MONITOR_TASK_PRIORITY 10
-#define MONITOR_TASK_STACK_SIZE 2048
-#define MONITOR_TASK_DELAY_MS (60 * 1000)
-
-static libtask_disposition_t monitor_trigger_once(rfm69hcw_w_irq_t* data) {
-    libirq_source_trigger(data->src);
-    vTaskDelay(MONITOR_TASK_DELAY_MS / portTICK_PERIOD_MS);
-
-    return LIBTASK_DISPOSITION_CONTINUE;
-}
-
 esp_err_t libsensor_drv_register_rfm69hcw_lacrosse(spi_host_device_t host,
-                                                   gpio_num_t pin_cs, gpio_num_t pin_rst, gpio_num_t pin_irq,
+                                                   gpio_num_t pin_cs,
+                                                   gpio_num_t pin_rst,
+                                                   gpio_num_t pin_irq,
                                                    const char* tag) {
     esp_err_t ret;
 
-    rfm69hcw_w_irq_t* data = malloc(sizeof(rfm69hcw_w_irq_t));
+    dev_info_t* info = malloc(sizeof(dev_info_t));
+    info->pin_irq = pin_irq;
 
     // Configure the ESP32 to communicate with the RFM69HCW on `host`.
-    ret = rfm69hcw_init(host, pin_cs, pin_rst, pin_irq, &data->dev);
+    ret = rfm69hcw_init(host, pin_cs, pin_rst, &info->dev);
     if (ret != ESP_OK) {
-        goto dev_init_fail;
+        free(info);
+        return ret;
     }
 
-    ret = libirq_source_create(pin_irq, true, IRQ_CORE_NUM, &data->src);
-    if (ret != ESP_OK) {
-        goto source_create_fail;
-    }
-    data->waiter = libirq_waiter_create(data->src);
-
-    // TODO consider measuring FEI
-
-    // This loop task just wakes up the poll task (using `libirq_source_trigger()`) every
-    // 60 seconds in order to get it to do a check of the current mode (so that we don't lock
-    // up if the RFM69HCW ever spontaneously decides to switch out of RX mode).
-    ret = libtask_loop_spawn((libtask_do_once_fn_t) monitor_trigger_once, data, "rfm69hcw_monitor_task",
-                             MONITOR_TASK_STACK_SIZE, MONITOR_TASK_PRIORITY, &data->monitor_task);
-    if (ret != ESP_OK) {
-        goto monitor_create_fail;
-    }
-
-    return libsensor_register(&SENSOR_RFM69HCW_LACROSSE, tag, data, NULL);
-
-monitor_create_fail:
-    libirq_source_destroy(data->src);
-    libirq_waiter_destroy(data->waiter);
-
-source_create_fail:
-    // TODO Implement a destructor!
-    // rfm69hcw_destroy(data->dev);
-    abort();
-
-dev_init_fail:
-    free(data);
-
-    return ret;
+    // Note that when `NULL` is passed, on failure libsensor calls
+    // `type->dev_destroy()` on `dev`, consuming it.
+    return libsensor_register(&SENSOR_RFM69HCW_LACROSSE, tag, info, NULL);
 }
