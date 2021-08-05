@@ -1,6 +1,6 @@
 {
     "name": "libsensor-drivers",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "description": "A library of sensor driver implementations using the libsensor framework.",
     "keywords": "bme280, ccs811, dps368, rfm69hcw, scd41, tmp117, sensor, esp-idf, esp32, esp8266",
     "repository": {
@@ -21,7 +21,7 @@
     "dependencies": {
         "khoek/libiot": "^3.0.0",
         "khoek/libesp": "^2.2.0",
-        "khoek/libsensor": "^2.0.0",
+        "khoek/libsensor": "^3.0.0",
         "khoek/libirq": "^2.0.0",
         "khoek/libtask": "^1.0.0",
         "khoek/libcrc": "^2.0.0",
