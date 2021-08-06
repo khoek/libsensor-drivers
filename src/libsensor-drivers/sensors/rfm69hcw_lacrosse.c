@@ -261,7 +261,7 @@ handle_lacrosse_breezepro_payload_out:
 }
 
 static cJSON* report(const char* tag, dev_info_t* info, ctx_t* ctx,
-                     const lacrosse_rx_t* frame) {
+                     lacrosse_rx_t* frame) {
     const lacrosse_packet_t* pkt = &frame->pkt;
 
     uint32_t id;
@@ -280,27 +280,35 @@ static cJSON* report(const char* tag, dev_info_t* info, ctx_t* ctx,
              tag, frame->rssi, id, seq_num, status, crc8_valid ? "OK" : "BAD",
              pkt->crc8, true_crc8);
 
+    cJSON* json = NULL;
+
     if (!crc8_valid) {
         ESP_LOGW(TAG, "bad crc!");
-        return NULL;
+        goto report_out;
     }
 
     switch ((id & MASK_LACROSSE_ID_TYPE) >> SHIFT_LACROSSE_ID_TYPE) {
         case LACROSSE_ID_TYPE_LTV_RV3: {
-            return handle_lacrosse_ltv_rv3_payload(tag, ctx, &pkt->data.payload,
+            json = handle_lacrosse_ltv_rv3_payload(tag, ctx, &pkt->data.payload,
                                                    frame->rssi);
+            break;
         }
         case LACROSSE_ID_TYPE_LTV_WSDTH04: {
-            return handle_lacrosse_ltv_wsdth04_payload(tag, &pkt->data.payload,
+            json = handle_lacrosse_ltv_wsdth04_payload(tag, &pkt->data.payload,
                                                        frame->rssi);
+            break;
         }
         default: {
             libiot_logf_error(TAG,
                               "well-formed packet with unknown id type: 0x%X",
                               id);
-            return NULL;
+            break;
         }
     }
+
+report_out:
+    free(frame);
+    return json;
 }
 
 static void handle_payload_ready(rfm69hcw_handle_t dev,
